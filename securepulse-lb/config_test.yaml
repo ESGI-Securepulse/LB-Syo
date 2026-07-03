@@ -1,0 +1,28 @@
+haproxy:
+  config_path: /etc/haproxy/haproxy.cfg
+  frontend_port: 25
+  frontend_port_imap: 143
+  frontend_port_imaps: 993
+  frontend_port_smtps: 465
+  frontend_port_submission: 587
+  pid_file: /var/run/haproxy.pid
+  socket: /var/run/haproxy/admin.sock
+  stats_port: 9000
+healthcheck:
+  check_ports:
+  - 25
+  - 143
+  interval_seconds: 5
+  timeout_seconds: 3
+logging:
+  backup_count: 5
+  file: test_logs/daemon.log
+  level: INFO
+  max_bytes: 10485760
+master:
+  dns: master.securepulse.fr
+  port: 8765
+node:
+  dns: ''
+  ip: ''
+  role: slave
