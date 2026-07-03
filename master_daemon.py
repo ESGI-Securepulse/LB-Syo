@@ -24,6 +24,8 @@ from websockets.exceptions import ConnectionClosed
 from dataclasses import dataclass
 from typing import Optional
 
+import etcd_client
+
 # ─────────────────────────────────────────────
 # Chargement de la configuration
 # ─────────────────────────────────────────────
@@ -113,15 +115,29 @@ class State:
 STATE = State()
 
 # ─────────────────────────────────────────────
-# DNS (mocké — brancher l'API OVH plus tard)
+# DNS (etcd/CoreDNS, lu par toutes les briques du projet)
 # ─────────────────────────────────────────────
+# Sur le déploiement On-Prem retenu (cf. rapport), le DNS public est géré via
+# CoreDNS (backend etcd) plutôt que l'API OVH — l'API OVH n'entre en jeu que
+# pour la délégation de zone elle-même (hors scope de ce daemon). Ce nom
+# "master.<domain>" est un pointeur de contrôle interne (les esclaves s'y
+# connectent pour trouver le maître courant), distinct du DNS public
+# mail.<domain> utilisé par les clients (cf. etcd_client.register_mail_entrypoint,
+# appelé depuis entrypoint.sh au démarrage/arrêt de chaque nœud HAProxy).
 
-def update_dns(ip: str, dns: str) -> None:
-    """
-    Met à jour l'entrée DNS pour pointer vers ip.
-    MOCKÉ : log uniquement. À remplacer par l'appel API OVH.
-    """
-    log.info(f"[DNS-MOCK] Mise à jour DNS : {dns} → {ip}")
+DNS_ETCD_URL = CFG.get("dns", {}).get("etcd_url", "http://etcd:2379")
+
+
+async def update_dns(ip: str, dns: str) -> None:
+    """Met à jour l'enregistrement DNS `dns` -> `ip` dans etcd/CoreDNS."""
+    label = dns.split(".")[0]
+    domain = ".".join(dns.split(".")[1:]) or CFG.get("dns", {}).get("domain", "securepulse.fr")
+    path = "/skydns/" + "/".join(reversed(domain.split(".")))
+    try:
+        await etcd_client.put(DNS_ETCD_URL, f"{path}/{label}", json.dumps({"host": ip}))
+        log.info(f"[DNS] Mise à jour : {dns} → {ip}")
+    except Exception as exc:
+        log.error(f"[DNS] Échec de mise à jour de {dns} : {exc}")
 
 
 # ─────────────────────────────────────────────
@@ -283,7 +299,7 @@ async def handle_message(ws, node: NodeInfo, msg: dict) -> None:
             f"[ELECTION] Nouveau maître annoncé par LB #{node.number} : "
             f"IP={msg.get('ip')} DNS={msg.get('dns')}"
         )
-        update_dns(msg.get("ip", ""), msg.get("dns", ""))
+        await update_dns(msg.get("ip", ""), msg.get("dns", ""))
         await asyncio.gather(
             *(send(w, msg) for w in STATE.lb_nodes.keys() if w is not ws)
         )
@@ -311,6 +327,20 @@ async def handle_message(ws, node: NodeInfo, msg: dict) -> None:
 # ─────────────────────────────────────────────
 
 async def cli_admin() -> None:
+    # En conteneur Docker (pas de TTY attaché, ou promotion d'un maître
+    # embarqué via slave_daemon.start_embedded_master()), stdin pointe vers
+    # /dev/null ou un pipe fermé : l'enregistrer auprès du sélecteur epoll
+    # échoue avec EPERM. Cet échec se produit de façon DIFFÉRÉE (callback
+    # asyncio interne programmé par connect_read_pipe), un try/except autour
+    # du seul `await` ne suffit pas à l'intercepter — d'où la vérification
+    # stricte d'un vrai TTY avant même de tenter quoi que ce soit. Le CLI
+    # admin est un outil d'exploitation bare-metal (cf. README) : sans TTY,
+    # on le désactive silencieusement plutôt que de polluer les logs à
+    # chaque promotion de maître.
+    if not sys.stdin.isatty():
+        log.debug("[CLI] pas de TTY, CLI admin désactivé")
+        return
+
     loop = asyncio.get_event_loop()
     reader = asyncio.StreamReader()
     protocol = asyncio.StreamReaderProtocol(reader)

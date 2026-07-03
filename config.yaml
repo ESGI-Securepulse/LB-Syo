@@ -1,3 +1,7 @@
+dns:
+  domain: securepulse.fr
+  etcd_url: http://etcd:2379
+  resolver_ip: 10.10.0.100
 haproxy:
   config_path: test_etc_haproxy/haproxy.cfg
   frontend_port: 25
@@ -26,3 +30,7 @@ node:
   dns: ''
   ip: ''
   role: slave
+  site: local
+wireguard:
+  listen_port: 51820
+  overlay_cidr: 10.99.0.0/16

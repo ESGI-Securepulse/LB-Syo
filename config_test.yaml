@@ -26,3 +26,11 @@ node:
   dns: ''
   ip: ''
   role: slave
+  site: local
+dns:
+  domain: securepulse.fr
+  etcd_url: http://etcd:2379
+  resolver_ip: 10.10.0.100
+wireguard:
+  overlay_cidr: 10.99.0.0/16
+  listen_port: 51820

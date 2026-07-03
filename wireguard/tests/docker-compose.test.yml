@@ -1,0 +1,86 @@
+name: lbsyo-wireguard-test
+
+###############################################################################
+# wireguard sidecar — banc de test autonome (3 sites, maillage complet)
+# Port range de test : 15000-20000
+###############################################################################
+
+networks:
+  backbone:
+    ipam: { config: [{ subnet: 10.61.0.0/24 }] }
+  site-a:
+    ipam: { config: [{ subnet: 10.61.1.0/24 }] }
+  site-b:
+    ipam: { config: [{ subnet: 10.61.2.0/24 }] }
+  site-c:
+    ipam: { config: [{ subnet: 10.61.3.0/24 }] }
+
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.13
+    container_name: wg-test-etcd
+    command:
+      - etcd
+      - --name=etcd0
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-cluster=etcd0=http://etcd:2380
+      - --initial-cluster-state=new
+    networks:
+      backbone: { ipv4_address: 10.61.0.2 }
+    ports: ["15379:2379"]
+    healthcheck:
+      test: ["CMD", "etcdctl", "--endpoints=http://localhost:2379", "endpoint", "health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  wg-a:
+    build: ../
+    container_name: wg-test-a
+    hostname: wg-a
+    cap_add: [NET_ADMIN]
+    environment:
+      ETCD_URL: http://etcd:2379
+      SITE: site-a
+      WG_SITE_PREFIX: "10.61.0."
+      WG_WATCH_INTERVAL: "3"
+    networks:
+      backbone: {}
+      site-a: { ipv4_address: 10.61.1.2 }
+    depends_on:
+      etcd: { condition: service_healthy }
+
+  wg-b:
+    build: ../
+    container_name: wg-test-b
+    hostname: wg-b
+    cap_add: [NET_ADMIN]
+    environment:
+      ETCD_URL: http://etcd:2379
+      SITE: site-b
+      WG_SITE_PREFIX: "10.61.0."
+      WG_WATCH_INTERVAL: "3"
+    networks:
+      backbone: {}
+      site-b: { ipv4_address: 10.61.2.2 }
+    depends_on:
+      etcd: { condition: service_healthy }
+
+  wg-c:
+    build: ../
+    container_name: wg-test-c
+    hostname: wg-c
+    cap_add: [NET_ADMIN]
+    environment:
+      ETCD_URL: http://etcd:2379
+      SITE: site-c
+      WG_SITE_PREFIX: "10.61.0."
+      WG_WATCH_INTERVAL: "3"
+    networks:
+      backbone: {}
+      site-c: { ipv4_address: 10.61.3.2 }
+    depends_on:
+      etcd: { condition: service_healthy }

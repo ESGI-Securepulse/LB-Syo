@@ -56,7 +56,20 @@ class SlaveState:
         self.my_number: int = 0
         self.my_ip: str = CFG["node"]["ip"]
         self.my_dns: str = CFG["node"]["dns"]
+        self.site: str = CFG["node"].get("site", "local")
         self.is_master: bool = False
+
+        # Devient True après la toute première connexion réussie au maître
+        # (réception d'un 'welcome'). Tant que ce flag est False, une échec
+        # de connexion signifie "aucun maître n'a encore été désigné" (état
+        # de démarrage à froid normal, cf. README "Le LB #1 ne se proclame
+        # jamais maître automatiquement") et NE DOIT PAS déclencher
+        # d'auto-élection — sinon, plusieurs LB démarrés en même temps
+        # s'auto-proclament tous maîtres indépendamment (split-brain) avant
+        # même qu'un enregistrement DNS master.<domain> n'existe. Une fois
+        # ever_connected=True, une déconnexion signifie une vraie panne du
+        # maître en place, et l'élection redevient légitime.
+        self.ever_connected: bool = False
 
         # Listes reçues du maître
         self.lb_list: list[dict] = []
@@ -72,22 +85,30 @@ class SlaveState:
 STATE = SlaveState()
 
 # ─────────────────────────────────────────────
-# Import local de haproxy_manager
+# Import local de haproxy_manager / etcd_client
 # ─────────────────────────────────────────────
-# Importé ici pour éviter la circularité ; haproxy_manager n'a pas
-# de dépendance sur slave_daemon.
+# Importés ici pour éviter la circularité ; ni l'un ni l'autre ne dépend
+# de slave_daemon.
 import haproxy_manager
+import etcd_client
 
 # ─────────────────────────────────────────────
-# DNS (mocké — brancher l'API OVH plus tard)
+# DNS (etcd/CoreDNS — voir le commentaire équivalent dans master_daemon.py)
 # ─────────────────────────────────────────────
 
-def update_dns(ip: str, dns: str = "master.securepulse.fr") -> None:
-    """
-    Met à jour l'entrée DNS pour pointer vers ip.
-    MOCKÉ : log uniquement. À remplacer par l'appel API OVH.
-    """
-    log.info(f"[DNS-MOCK] Mise à jour DNS : {dns} → {ip}")
+DNS_ETCD_URL = CFG.get("dns", {}).get("etcd_url", "http://etcd:2379")
+
+
+async def update_dns(ip: str, dns: str = "master.securepulse.fr") -> None:
+    """Met à jour l'enregistrement DNS `dns` -> `ip` dans etcd/CoreDNS."""
+    label = dns.split(".")[0]
+    domain = ".".join(dns.split(".")[1:]) or CFG.get("dns", {}).get("domain", "securepulse.fr")
+    path = "/skydns/" + "/".join(reversed(domain.split(".")))
+    try:
+        await etcd_client.put(DNS_ETCD_URL, f"{path}/{label}", json.dumps({"host": ip}))
+        log.info(f"[DNS] Mise à jour : {dns} → {ip}")
+    except Exception as exc:
+        log.error(f"[DNS] Échec de mise à jour de {dns} : {exc}")
 
 
 # ─────────────────────────────────────────────
@@ -125,12 +146,13 @@ async def connect_to_master() -> None:
                     STATE.my_number = msg["assigned_number"]
                     STATE.lb_list = msg.get("lb_list", [])
                     STATE.mail_list = msg.get("mail_list", [])
+                    STATE.ever_connected = True
                     log.info(
                         f"[WELCOME] Numéro attribué : #{STATE.my_number} | "
                         f"LB connus : {len(STATE.lb_list)} | Mail connus : {len(STATE.mail_list)}"
                     )
                     # Génération initiale de la config HAProxy
-                    haproxy_manager.reload_from_list(STATE.mail_list)
+                    haproxy_manager.reload(STATE.site)
 
                 # ── Boucle de réception ──────────────────────────────────
                 async for raw in ws:
@@ -140,8 +162,19 @@ async def connect_to_master() -> None:
             log.warning(f"[DISCONNECT] Connexion maître perdue : {exc}")
             STATE.master_ws = None
 
-            # ── Procédure d'élection si on est LB #2 ────────────────────
-            await maybe_trigger_election()
+            # ── Procédure d'élection, uniquement après une vraie panne ──
+            # Ne PAS élire au tout premier échec de connexion (démarrage à
+            # froid, aucun maître encore désigné/enregistré) : sinon,
+            # plusieurs LB démarrés en même temps s'auto-proclament tous
+            # maîtres avant qu'aucun n'ait pu enregistrer master.<domain> —
+            # split-brain. cf. commentaire sur SlaveState.ever_connected.
+            if STATE.ever_connected:
+                await maybe_trigger_election()
+            else:
+                log.info(
+                    "[BOOTSTRAP] Aucun maître joignable pour l'instant "
+                    "(démarrage à froid) — nouvelle tentative, pas d'élection"
+                )
 
             # Pause avant nouvelle tentative (si on n'est pas devenu maître)
             if not STATE.is_master:
@@ -178,8 +211,11 @@ async def handle_master_message(msg: dict) -> None:
             f"[UPDATE] Liste mise à jour — LB: {len(STATE.lb_list)}, "
             f"Mail: {len(STATE.mail_list)}, Mon numéro: #{STATE.my_number}"
         )
-        # Régénère et recharge la config HAProxy avec la nouvelle liste
-        haproxy_manager.reload_from_list(STATE.mail_list)
+        # Pas de rechargement HAProxy ici : depuis la fusion avec LB-Lucien,
+        # generate_config() résout les backends dynamiquement via DNS
+        # (resolvers + server-template, hold valid 5s). STATE.mail_list reste
+        # suivie pour le CLI/les stats, mais n'a plus besoin de déclencher un
+        # rechargement — HAProxy redécouvre les srv-mail tout seul.
 
     elif mtype == "update_config":
         config = msg.get("haproxy_config", "")
@@ -278,7 +314,7 @@ async def become_master() -> None:
     log.info(f"[ELECTION] Ce LB ({STATE.my_dns}) se proclame nouveau maître")
 
     # Mise à jour DNS
-    update_dns(STATE.my_ip, "master.securepulse.fr")
+    await update_dns(STATE.my_ip, "master.securepulse.fr")
 
     # Message d'élection à propager
     election_msg = {
@@ -334,14 +370,18 @@ async def report_mail_down(mail_ip: str) -> None:
     """
     Signale au maître (ou gère localement si maître) qu'un srv-mail est tombé.
     Appelé par healthcheck.py.
+
+    Ne déclenche plus de rechargement HAProxy (cf. handle_master_message) :
+    HAProxy fait déjà son propre tcp-check (inter 5s fall 2 rise 2) sur les
+    backends résolus par DNS et les retire seul de la rotation. Cette
+    fonction ne sert plus qu'à tenir STATE.mail_list à jour pour le CLI/les
+    stats et à informer le reste du cluster (logs, visibilité globale).
     """
     log.warning(f"[HEALTHCHECK] Srv-mail {mail_ip} signalé hors ligne")
 
     if STATE.is_master:
-        # On est le maître : on retire directement et on recharge
         STATE.mail_list = [m for m in STATE.mail_list if m["ip"] != mail_ip]
-        haproxy_manager.reload_from_list(STATE.mail_list)
-        log.info(f"[HEALTHCHECK] Mail {mail_ip} retiré et HAProxy rechargé")
+        log.info(f"[HEALTHCHECK] Mail {mail_ip} retiré de la liste suivie (maître)")
     elif STATE.master_ws is not None:
         # On envoie l'alerte au maître
         alert = {"type": "healthcheck_alert", "ip": mail_ip}
@@ -350,10 +390,8 @@ async def report_mail_down(mail_ip: str) -> None:
         except ConnectionClosed:
             log.warning("[HEALTHCHECK] Maître injoignable pour l'alerte")
     else:
-        # Pas de maître joignable : on recharge HAProxy localement
-        log.warning("[HEALTHCHECK] Aucun maître joignable, rechargement HAProxy local")
+        log.warning("[HEALTHCHECK] Aucun maître joignable, mise à jour locale uniquement")
         STATE.mail_list = [m for m in STATE.mail_list if m["ip"] != mail_ip]
-        haproxy_manager.reload_from_list(STATE.mail_list)
 
 
 # ─────────────────────────────────────────────
@@ -364,6 +402,20 @@ async def main() -> None:
     log.info(
         f"[SLAVE] Démarrage du daemon esclave — IP={STATE.my_ip} DNS={STATE.my_dns}"
     )
+
+    # Import différé : healthcheck.py fait `import slave_daemon` au niveau
+    # module, un import direct ici en tête de fichier créerait un cycle.
+    #
+    # Important : healthcheck.py DOIT tourner dans CE process (pas comme un
+    # service OS séparé) pour partager le même STATE. Le déploiement Alpine
+    # historique (deploy.sh) le lançait comme un second service OpenRC
+    # indépendant important slave_daemon — dans un process séparé, cet
+    # import lui donne sa PROPRE instance de STATE.mail_list, toujours vide,
+    # rendant le healthcheck muet en pratique. C'est corrigé ici et dans
+    # deploy.sh (service OpenRC securepulse-health retiré).
+    import healthcheck
+    asyncio.create_task(healthcheck.run_healthcheck())
+
     await connect_to_master()
 
 

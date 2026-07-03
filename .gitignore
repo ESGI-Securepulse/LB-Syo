@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+test_logs/
+test_etc_haproxy/
+.env
+.env.local
+wireguard/tests/certs/

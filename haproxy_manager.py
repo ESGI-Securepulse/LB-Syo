@@ -47,13 +47,31 @@ log.addHandler(_sh)
 # Génération de la configuration HAProxy
 # ─────────────────────────────────────────────
 
-def generate_config(mail_list: list[dict]) -> str:
+def generate_config(site: str) -> str:
     """
-    Génère une configuration HAProxy complète à partir
-    de la liste des srv-mail actifs.
-    Supporte SMTP (25/587/465), IMAP (143/993).
+    Génère une configuration HAProxy complète à base de résolution DNS
+    dynamique (resolvers + server-template), fusion de deux implémentations
+    du projet :
+      - LB-Syo (ce repo) : daemon Python d'élection maître/esclave, HA du LB.
+      - LB-Lucien (fusionné ici) : découverte dynamique des backends via
+        CoreDNS/etcd plutôt qu'une liste statique d'IP.
+
+    Deux paliers par protocole (Q&A rapport : "HAProxy préfère les serveurs
+    internes du DC, redirige via VPN si chargé/en panne") :
+      - pool local  : postfix.<site>.<domain> / dovecot.<site>.<domain>
+      - pool replis : postfix.all.<domain> / dovecot.all.<domain> (backup ;
+        HAProxy ne les utilise que si tous les serveurs du pool local sont
+        down, atteignables via le maillage WireGuard inter-DC)
+
+    Ne dépend plus d'une liste de srv-mail suivie en mémoire par le daemon
+    (STATE.mail_list) : les backends apparaissent/disparaissent tout seuls
+    via la résolution DNS (TTL court, `hold valid 5s`), exactement comme le
+    reste de la plateforme (LDAP, Mail, DNS) le fait déjà via etcd/CoreDNS.
     """
     ha = CFG["haproxy"]
+    dns_cfg = CFG.get("dns", {})
+    domain = dns_cfg.get("domain", "securepulse.fr")
+    resolver_ip = dns_cfg.get("resolver_ip", "10.10.0.100")
 
     # ── Section global & defaults ────────────────────────────────────────
     config = f"""global
@@ -77,6 +95,18 @@ defaults
     timeout server  1m
     retries 3
 
+# ── Résolution DNS dynamique (CoreDNS + etcd) ────────────────────────────
+# Les backends (postfix/dovecot) s'enregistrent et se désenregistrent
+# eux-mêmes dans etcd au démarrage/arrêt (voir Mail/postfix, Mail/dovecot) ;
+# HAProxy les redécouvre automatiquement, sans rechargement de config.
+resolvers coredns
+    nameserver dns {resolver_ip}:53
+    accepted_payload_size 8192
+    hold valid 5s
+    hold other 10s
+    resolve_retries 3
+    timeout retry 1s
+
 # ── Statistiques ─────────────────────────────────────────────────────────
 listen stats
     bind *:{ha['stats_port']}
@@ -91,40 +121,21 @@ listen stats
 """
 
     # ── Frontends & backends pour chaque protocole ───────────────────────
+    # "service" = nom du backend applicatif enregistré dans etcd par Mail/
+    # (postfix pour smtp/submission/smtps, dovecot pour imap/imaps).
     protocols = [
-        {
-            "name": "smtp",
-            "port": ha["frontend_port"],
-            "backend": "be_smtp",
-            "check_port": 25,
-        },
-        {
-            "name": "submission",
-            "port": ha["frontend_port_submission"],
-            "backend": "be_submission",
-            "check_port": 587,
-        },
-        {
-            "name": "smtps",
-            "port": ha["frontend_port_smtps"],
-            "backend": "be_smtps",
-            "check_port": 465,
-        },
-        {
-            "name": "imap",
-            "port": ha["frontend_port_imap"],
-            "backend": "be_imap",
-            "check_port": 143,
-        },
-        {
-            "name": "imaps",
-            "port": ha["frontend_port_imaps"],
-            "backend": "be_imaps",
-            "check_port": 993,
-        },
+        {"name": "smtp",       "port": ha["frontend_port"],            "backend": "be_smtp",       "check_port": 25,  "service": "postfix"},
+        {"name": "submission", "port": ha["frontend_port_submission"], "backend": "be_submission", "check_port": 587, "service": "postfix"},
+        {"name": "smtps",      "port": ha["frontend_port_smtps"],      "backend": "be_smtps",      "check_port": 465, "service": "postfix"},
+        {"name": "imap",       "port": ha["frontend_port_imap"],       "backend": "be_imap",       "check_port": 143, "service": "dovecot"},
+        {"name": "imaps",      "port": ha["frontend_port_imaps"],      "backend": "be_imaps",      "check_port": 993, "service": "dovecot"},
     ]
 
     for proto in protocols:
+        service = proto["service"]
+        local_fqdn = f"{service}.{site}.{domain}"
+        all_fqdn = f"{service}.all.{domain}"
+
         # Frontend
         config += f"""frontend fe_{proto['name']}
     bind *:{proto['port']}
@@ -132,26 +143,17 @@ listen stats
     default_backend {proto['backend']}
 
 """
-        # Backend
+        # Backend : pool local préféré, pool global (toutes régions, via VPN)
+        # en secours uniquement si le pool local est intégralement down.
         config += f"""backend {proto['backend']}
     mode tcp
     balance roundrobin
     option tcp-check
     tcp-check connect port {proto['check_port']}
+    server-template {service}-local 1-10 {local_fqdn}:{proto['check_port']} resolvers coredns resolve-prefer ipv4 check inter 5s fall 2 rise 2
+    server-template {service}-remote 1-10 {all_fqdn}:{proto['check_port']} resolvers coredns resolve-prefer ipv4 check inter 5s fall 2 rise 2 backup
+
 """
-
-        if not mail_list:
-            # Aucun serveur mail : on ajoute un commentaire explicatif
-            config += "    # Aucun srv-mail actif\n"
-        else:
-            for mail in mail_list:
-                server_name = mail.get("dns", mail["ip"]).replace(".", "-").replace(":", "-")
-                config += (
-                    f"    server {server_name} {mail['ip']}:{proto['check_port']} "
-                    f"check inter 2s fall 3 rise 2\n"
-                )
-
-        config += "\n"
 
     return config
 
@@ -208,12 +210,14 @@ def reload_haproxy() -> bool:
         return False
 
 
-def reload_from_list(mail_list: list[dict]) -> bool:
+def reload(site: str) -> bool:
     """
-    Raccourci : génère la config à partir de mail_list,
-    l'écrit et recharge HAProxy.
+    Raccourci : génère la config résolveur-DNS pour ce site, l'écrit et
+    recharge HAProxy. Idempotent — le contenu ne dépend que de `site` (pas
+    d'une liste de mail_list suivie en mémoire), donc rappelable sans risque
+    à chaque événement de topologie (nouveau nœud, alerte healthcheck...).
     """
-    config = generate_config(mail_list)
+    config = generate_config(site)
     write_config(config)
     return reload_haproxy()
 
@@ -232,12 +236,7 @@ def write_and_reload(config: str) -> bool:
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Exemple de test avec une liste fictive
-    test_mail_list = [
-        {"ip": "192.168.1.10", "dns": "mail1.securepulse.fr", "number": 1},
-        {"ip": "192.168.1.11", "dns": "mail2.securepulse.fr", "number": 2},
-    ]
-    cfg = generate_config(test_mail_list)
+    cfg = generate_config(CFG.get("node", {}).get("site", "local"))
     print(cfg)
     write_config(cfg)
     print("[TEST] Config écrite. Exécutez reload_haproxy() pour recharger.")

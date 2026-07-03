@@ -44,6 +44,12 @@ read -r NODE_DNS
 
 [ -z "$NODE_DNS" ] && error "Le DNS ne peut pas être vide."
 
+# Site/DC de rattachement (utilisé pour la résolution DNS des backends
+# postfix.<site>./dovecot.<site>. en priorité sur le pool postfix.all./dovecot.all.)
+printf "Entrez le nom du site/DC de rattachement (ex: lyon) : "
+read -r NODE_SITE
+[ -z "$NODE_SITE" ] && error "Le site ne peut pas être vide."
+
 # Vérification que le DNS n'est pas déjà pris
 info "Vérification que $NODE_DNS est disponible..."
 if host "$NODE_DNS" > /dev/null 2>&1; then
@@ -99,7 +105,7 @@ cp "$SCRIPT_DIR/config.yaml"       /opt/securepulse/
 # ─────────────────────────────────────────────
 # Personnalisation de la config YAML
 # ─────────────────────────────────────────────
-info "Configuration du nœud (IP=$NODE_IP, DNS=$NODE_DNS)..."
+info "Configuration du nœud (IP=$NODE_IP, DNS=$NODE_DNS, site=$NODE_SITE)..."
 
 # Remplacement des valeurs dans config.yaml via Python (plus fiable que sed sur Alpine)
 python3 - <<EOF
@@ -111,6 +117,7 @@ with open('/opt/securepulse/config.yaml', 'r') as f:
 cfg['node']['ip']   = '$NODE_IP'
 cfg['node']['dns']  = '$NODE_DNS'
 cfg['node']['role'] = 'slave'
+cfg['node']['site'] = '$NODE_SITE'
 
 with open('/opt/securepulse/config.yaml', 'w') as f:
     yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
@@ -119,12 +126,12 @@ print("  config.yaml mis à jour.")
 EOF
 
 # ─────────────────────────────────────────────
-# Génération d'une config HAProxy initiale (vide)
+# Génération d'une config HAProxy initiale
 # ─────────────────────────────────────────────
-info "Génération de la config HAProxy initiale..."
+info "Génération de la config HAProxy initiale (résolveurs DNS, site=$NODE_SITE)..."
 cd /opt/securepulse && python3 -c "
 import haproxy_manager
-cfg = haproxy_manager.generate_config([])
+cfg = haproxy_manager.generate_config('$NODE_SITE')
 haproxy_manager.write_config(cfg)
 print('  Config HAProxy initiale générée.')
 "
@@ -154,39 +161,19 @@ INITD
 chmod +x /etc/init.d/securepulse-slave
 
 # ─────────────────────────────────────────────
-# Service OpenRC pour le healthcheck
-# ─────────────────────────────────────────────
-info "Création du service OpenRC pour le healthcheck..."
-cat > /etc/init.d/securepulse-health << 'INITD'
-#!/sbin/openrc-run
-
-name="securepulse-health"
-description="SecurePulse LB Healthcheck"
-command="/usr/bin/python3"
-command_args="/opt/securepulse/healthcheck.py"
-command_background="yes"
-pidfile="/var/run/securepulse-health.pid"
-output_log="/var/log/securepulse/healthcheck.log"
-error_log="/var/log/securepulse/healthcheck.log"
-directory="/opt/securepulse"
-
-depend() {
-    need net securepulse-slave
-}
-INITD
-chmod +x /etc/init.d/securepulse-health
-
-# ─────────────────────────────────────────────
 # Démarrage des services
 # ─────────────────────────────────────────────
+# Le healthcheck tourne désormais DANS le process du daemon esclave
+# (slave_daemon.py importe healthcheck.py et lance sa boucle comme tâche
+# asyncio) — nécessaire pour qu'il partage le même état STATE.mail_list.
+# Lancé comme process OpenRC séparé, il aurait sa propre instance vide de
+# STATE et ne détecterait jamais rien. Pas de service securepulse-health.
 info "Activation et démarrage des services..."
 rc-update add securepulse-slave default
-rc-update add securepulse-health default
 rc-update add haproxy default
 
 service haproxy start        || warn "HAProxy n'a pas démarré (config vide attendue)"
 service securepulse-slave start
-service securepulse-health start
 
 # ─────────────────────────────────────────────
 # Résumé
