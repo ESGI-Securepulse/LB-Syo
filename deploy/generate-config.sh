@@ -15,7 +15,7 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 SITE=""; ROLE="slave"; ETCD_URL=""; DOMAIN="securepulse.fr"
-RESOLVER_IP=""; WG_SITE_PREFIX=""
+RESOLVER_IP=""; WG_SITE_PREFIX=""; WG_GATEWAY_IP=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -25,6 +25,7 @@ while [ $# -gt 0 ]; do
         --domain) DOMAIN="$2"; shift 2 ;;
         --resolver-ip) RESOLVER_IP="$2"; shift 2 ;;
         --wg-site-prefix) WG_SITE_PREFIX="$2"; shift 2 ;;
+        --gateway-ip) WG_GATEWAY_IP="$2"; shift 2 ;;
         *) echo "unknown arg: $1" >&2; exit 1 ;;
     esac
 done
@@ -33,6 +34,7 @@ done
 [ -n "$ETCD_URL" ] || { echo "--etcd-url is required" >&2; exit 1; }
 [ -n "$WG_SITE_PREFIX" ] || { echo "--wg-site-prefix is required (ex: 10.10.1. — préfixe IP local du DC)" >&2; exit 1; }
 [ -n "$RESOLVER_IP" ] || { echo "--resolver-ip is required (IP du conteneur DNS/CoreDNS de ce site)" >&2; exit 1; }
+[ -n "$WG_GATEWAY_IP" ] || { echo "--gateway-ip is required (IP fixe à réserver pour ce sidecar sur le LAN du DC, ex: 10.20.1.101 — les autres serveurs du DC en ont besoin AVANT que ce conteneur ne démarre)" >&2; exit 1; }
 
 OUT_DIR="sites/${SITE}"
 mkdir -p "$OUT_DIR"
@@ -46,6 +48,7 @@ RESOLVER_IP=${RESOLVER_IP}
 WG_SITE_PREFIX=${WG_SITE_PREFIX}
 WG_ETCD_URL=${ETCD_URL}
 WG_GATEWAY_ROUTING=1
+WG_GATEWAY_IP=${WG_GATEWAY_IP}
 EOF
 
 echo "[generate-config] écrit ${OUT_DIR}/.env"

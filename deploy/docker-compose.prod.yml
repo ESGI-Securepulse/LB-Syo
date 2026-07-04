@@ -34,3 +34,19 @@ services:
       ETCD_URL: "${WG_ETCD_URL}"
       WG_SITE_PREFIX: "${WG_SITE_PREFIX}"
       WG_GATEWAY_ROUTING: "${WG_GATEWAY_ROUTING}"
+    networks:
+      site_lan:
+        ipv4_address: "${WG_GATEWAY_IP}"
+
+# IP statique et prévisible (WG_GATEWAY_IP) : les autres serveurs du même DC
+# (storage-lucien, LDAP, Mail) ont besoin de connaître cette adresse pour
+# router leur trafic inter-site AVANT que cette passerelle ne soit
+# elle-même déployée (generate-config.sh la leur donne en paramètre, pas
+# une valeur découverte après coup). `site_lan` doit être le même réseau
+# (bridge en test/mono-serveur, macvlan en LAN physique réel — cf.
+# storage-lucien/deploy/docker-compose.prod.yml) que celui des autres
+# serveurs de ce DC.
+networks:
+  site_lan:
+    external: true
+    name: "dc-${SITE}-lan"
