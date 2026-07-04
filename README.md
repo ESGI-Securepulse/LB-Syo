@@ -25,10 +25,11 @@ couvre à la fois :
 | `haproxy_manager.py` | Génération de la config HAProxy (résolveurs DNS dynamiques) et rechargement sans downtime |
 | `etcd_client.py` | Client etcd v3 minimal — DNS réel (remplace le mock `update_dns()`) |
 | `run.py` | Point d'entrée du conteneur Docker (orchestre master+slave dans un seul process) |
-| `entrypoint.sh` / `Dockerfile` | Déploiement Docker (simulation/tests) |
-| `deploy.sh` | Déploiement bare-metal Alpine Linux (production réelle) |
+| `entrypoint.sh` / `Dockerfile` | Image du conteneur (config générée depuis les variables d'env à chaque démarrage) |
+| `deploy/` | **Déploiement réel actuel (containerisé)** : `generate-config.sh` + `docker-compose.prod.yml` + `deploy.sh <site>`, un LB + son sidecar WireGuard par serveur |
+| `deploy.sh` (racine) | Déploiement bare-metal historique (Alpine/OpenRC) — antérieur à la contrainte projet "tout containerisé", conservé tel quel mais **superseded par `deploy/`** pour tout nouveau déploiement |
 | `wireguard/` | Sidecar maillage VPN site-à-site auto-géré |
-| `config.yaml` | Configuration centralisée |
+| `config.yaml` | Configuration centralisée (banc de test mono-hôte ; régénérée depuis l'env en déploiement réel) |
 
 ---
 
@@ -43,16 +44,37 @@ couvre à la fois :
 
 ---
 
-## Déploiement rapide (bare-metal)
+## Déploiement réel (containerisé, un serveur par DC/nœud)
 
 ```sh
-# Sur chaque machine LB (en root)
-chmod +x deploy.sh
-./deploy.sh
-# Le script demande : IP publique, DNS souhaité, site/DC de rattachement
+cd deploy
+./generate-config.sh --site lyon --role master --etcd-url http://<etcd-reachable>:2379 \
+    --wg-site-prefix 10.20.1. --resolver-ip 10.20.1.100
+./deploy.sh lyon
 ```
 
-## Déploiement rapide (Docker / simulation)
+Démarre le conteneur `lb` (HAProxy + daemon) et son sidecar `wireguard`
+(passerelle site-à-site de ce DC, `WG_GATEWAY_ROUTING=1`) dans le **même**
+namespace réseau (`network_mode: service:wireguard`) — le LB hérite
+directement de `wg0` et des routes overlay, cohérent avec "un accès VPN par
+DC" (rapport §40). Les autres serveurs de ce même DC (storage-lucien,
+Mail, LDAP) utilisent l'IP affichée en fin de `deploy.sh` comme
+`WG_GATEWAY_IP` pour router leur trafic inter-site à travers cette
+passerelle. Voir `add_new_dc.sh` à la racine du projet pour générer la
+config de tous les serveurs d'un nouveau DC en une seule commande.
+
+## Déploiement bare-metal (historique, superseded)
+
+```sh
+# Sur chaque machine LB (en root) — installe des paquets directement sur
+# l'hôte (apk, OpenRC) : antérieur à la contrainte projet "tout
+# containerisé", conservé tel quel pour mémoire, mais plus le chemin
+# recommandé (préférer deploy/ ci-dessus).
+chmod +x deploy.sh
+./deploy.sh
+```
+
+## Banc de test (Docker / simulation mono-hôte)
 
 ```sh
 docker build -t lb-syo .

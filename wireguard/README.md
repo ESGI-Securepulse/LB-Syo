@@ -30,6 +30,38 @@ un déploiement réel sur noyau < 5.6 est identifié.
 | `WG_OVERLAY_CIDR` | `10.99.0.0/16` | Plage overlay du maillage |
 | `WG_SITE_PREFIX` | *(auto)* | Préfixe IP à utiliser comme endpoint public (sinon 1ère IP non-loopback) |
 | `WG_WATCH_INTERVAL` | `15` | Intervalle (s) de resynchronisation des peers |
+| `WG_GATEWAY_ROUTING` | `0` | `1` = ce conteneur devient la passerelle site-à-site de son DC (voir ci-dessous) |
+
+## Passerelle site-à-site réelle (`WG_GATEWAY_ROUTING=1`)
+
+Sur le banc de test mono-hôte (tous les DC sur un même sous-réseau Docker
+plat), n'importe quel conteneur peut déjà joindre n'importe quel autre —
+le maillage WireGuard lui-même fonctionne, mais rien ne prouve qu'il soit
+réellement *nécessaire*. En déploiement réel (chaque DC sur son propre
+réseau/serveur), seul CE conteneur est joignable depuis les autres sites
+par défaut : ses voisins du même DC (storage-lucien, LDAP, Mail, HAProxy)
+ne le sont pas tant que ce conteneur n'agit pas comme passerelle.
+
+Avec `WG_GATEWAY_ROUTING=1` :
+1. `net.ipv4.ip_forward=1` est activé **dans le namespace réseau de ce
+   conteneur uniquement** (capacité `NET_ADMIN`, aucune modification de
+   l'hôte — ce réglage est per-netns, pas un sysctl noyau global) et la
+   politique `FORWARD` d'iptables passe à `ACCEPT`.
+2. À chaque cycle, l'agent interroge etcd pour les adresses que chaque
+   site distant a enregistrées (`/storage-nodes/<site>/` — géo-réplication
+   GlusterFS — et `/skydns/fr/securepulse/<site>/` — LDAP/Mail/HAProxy,
+   pour le failover DNS vers le pool `all.<domaine>`), les ajoute aux
+   `allowed-ips` du peer WireGuard correspondant, et installe une route
+   noyau locale (`ip route replace <ip>/32 dev wg0`) pour chacune.
+3. Les autres conteneurs du même DC doivent alors router leur trafic
+   sortant vers ces adresses distantes via l'IP locale de CE conteneur
+   (variable d'env `WG_GATEWAY_IP` côté storage-lucien/LDAP/Mail — voir
+   leurs README respectifs) : la table de routage noyau de wireguard_agent
+   ne peut pas, à elle seule, faire apparaître une route chez un voisin.
+
+Désactivé par défaut (`0`) pour ne rien changer au comportement du banc de
+test mono-hôte existant. Voir `integration/tests/topology-isolated/` pour
+la validation en réseaux réellement isolés (sans sous-réseau partagé).
 
 ## Tests
 

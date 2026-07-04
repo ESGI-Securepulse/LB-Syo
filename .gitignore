@@ -5,3 +5,5 @@ test_etc_haproxy/
 .env
 .env.local
 wireguard/tests/certs/
+deploy/sites/*
+!deploy/sites/.gitkeep

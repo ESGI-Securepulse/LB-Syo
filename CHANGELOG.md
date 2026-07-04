@@ -3,6 +3,21 @@
 ## [Unreleased]
 
 ### Ajouté
+- `wireguard/` : le sidecar peut désormais agir comme **passerelle
+  site-à-site** (`WG_GATEWAY_ROUTING=1`, déploiement réel multi-hôtes
+  uniquement) — forwarding IP + annonce dans les `allowed-ips` des
+  adresses que chaque site distant enregistre dans etcd
+  (`/storage-nodes/<site>/`, `/skydns/fr/securepulse/<site>/`), avec
+  installation des routes noyau correspondantes. Sans ce mécanisme, seul
+  le conteneur wireguard lui-même était joignable depuis un autre DC ; ses
+  voisins du même serveur/DC (storage-lucien, LDAP, Mail, HAProxy) ne
+  l'étaient pas. Désactivé par défaut, aucun changement pour le banc de
+  test mono-hôte existant.
+- `deploy/` : déploiement réel containerisé (un LB + son sidecar
+  WireGuard par serveur, `network_mode: service:wireguard` — cohérent avec
+  "un accès VPN par DC" du rapport). `generate-config.sh` produit le
+  `.env` du site, `deploy.sh <site>` lance la stack et affiche l'IP de
+  passerelle à donner aux autres serveurs du même DC.
 - Fusion avec `LB-Lucien` : résolution DNS dynamique des backends mail
   (`resolvers` + `server-template` HAProxy, pools local préféré + global en
   secours/backup) — remplace la génération de config à partir d'une liste

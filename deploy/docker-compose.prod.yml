@@ -1,0 +1,36 @@
+# LB-Syo/deploy/docker-compose.prod.yml — un nœud LB (HAProxy + daemon) et
+# son sidecar WireGuard, pour CE serveur réel. entrypoint.sh régénère
+# config.yaml entièrement depuis les variables d'env ci-dessous à chaque
+# démarrage (aucune édition manuelle de fichier requise).
+services:
+  lb:
+    build: ..
+    container_name: lb-${SITE}
+    restart: always
+    network_mode: "service:wireguard"
+    environment:
+      SITE: "${SITE}"
+      ROLE: "${ROLE}"
+      ETCD_URL: "${ETCD_URL}"
+      DOMAIN: "${DOMAIN}"
+      RESOLVER_IP: "${RESOLVER_IP}"
+    depends_on:
+      - wireguard
+
+  # network_mode: service:wireguard place lb DANS le netns du sidecar
+  # wireguard : HAProxy/le daemon héritent directement de wg0 et des routes
+  # passerelle installées par celui-ci (WG_GATEWAY_ROUTING), sans avoir à
+  # dupliquer la logique de routage côté image lb-syo elle-même.
+  wireguard:
+    build: ../wireguard
+    container_name: lb-${SITE}-wireguard
+    restart: always
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun"]
+    ports:
+      - "51820:51820/udp"
+    environment:
+      SITE: "${SITE}"
+      ETCD_URL: "${WG_ETCD_URL}"
+      WG_SITE_PREFIX: "${WG_SITE_PREFIX}"
+      WG_GATEWAY_ROUTING: "${WG_GATEWAY_ROUTING}"

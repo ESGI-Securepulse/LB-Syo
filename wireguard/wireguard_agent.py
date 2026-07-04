@@ -49,6 +49,19 @@ SITE_PREFIX = os.environ.get("WG_SITE_PREFIX")  # ex: "10.10.1." — préfixe IP
 KEY_DIR = Path(os.environ.get("WG_KEY_DIR", "/etc/wireguard"))
 TECH_DIR = Path(os.environ.get("WG_TECH_DIR", "/etc/wireguard/technicians"))
 WATCH_INTERVAL = int(os.environ.get("WG_WATCH_INTERVAL", "15"))
+# Passerelle site-à-site (déploiement multi-hôtes réel uniquement) : si non
+# vide, ce conteneur route vers l'overlay le trafic venant des autres
+# conteneurs du même DC (storage-lucien, LDAP, Mail, HAProxy) à destination
+# des adresses que les AUTRES sites annoncent dans etcd (voir
+# sync_gateway_routes). Sur le banc de test mono-hôte (tous les sites sur un
+# même sous-réseau plat), ce mécanisme est inutile et reste désactivé :
+# activé uniquement quand WG_GATEWAY_ROUTING=1.
+GATEWAY_ROUTING = os.environ.get("WG_GATEWAY_ROUTING", "0") == "1"
+# Préfixes etcd à surveiller pour découvrir les adresses IP « du site » à
+# rendre joignables depuis les autres DC via ce tunnel (storage-nodes pour
+# la géo-réplication GlusterFS, skydns pour le failover LDAP/Mail/HAProxy
+# inter-site déclenché par résolution DNS vers le pool "all.<domaine>").
+GATEWAY_ROUTE_PREFIXES = ["/storage-nodes/", "/skydns/fr/securepulse/"]
 
 _running = True
 _technician_pubkey: str | None = None  # exclu du nettoyage "stale" de sync_peers
@@ -181,8 +194,51 @@ def setup_interface(privkey: str, overlay_ip: str) -> None:
     priv_file.unlink()
 
 
-def sync_peers(current_peers: dict[str, dict], my_pubkey: str, my_ip: str) -> None:
+def enable_forwarding() -> None:
+    """Fait de ce conteneur la passerelle site-à-site de son DC (déploiement
+    réel multi-hôtes uniquement, cf. GATEWAY_ROUTING). Namespace réseau du
+    conteneur uniquement (capacité NET_ADMIN) — aucune modification de
+    l'hôte : `net.ipv4.ip_forward` est per-netns, pas un réglage sysctl
+    global du noyau hôte."""
+    Path("/proc/sys/net/ipv4/ip_forward").write_text("1\n")
+    sh("iptables", "-P", "FORWARD", "ACCEPT", check=False)
+    log.info("gateway routing enabled: ip_forward=1, FORWARD policy=ACCEPT")
+
+
+async def discover_site_addresses(session: aiohttp.ClientSession, site: str) -> set[str]:
+    """Adresses IP « appartenant » à un site (nœuds storage-lucien pour la
+    géo-réplication, services enregistrés dans etcd/skydns pour le failover
+    LDAP/Mail/HAProxy inter-site) à rendre joignables depuis les autres DC."""
+    addrs: set[str] = set()
+    for prefix in GATEWAY_ROUTE_PREFIXES:
+        try:
+            entries = await etcd_list(session, f"{prefix}{site}/")
+        except (aiohttp.ClientError, json.JSONDecodeError):
+            continue
+        for info in entries.values():
+            host = info.get("host")
+            if host:
+                addrs.add(host)
+    return addrs
+
+
+def sync_gateway_routes(wanted_ips: set[str]) -> None:
+    """Installe les routes noyau locales (conteneur wireguard uniquement)
+    permettant de forwarder vers wg0 le trafic à destination des adresses
+    des autres sites. Complément indispensable de allowed-ips : `wg set`
+    (contrairement à wg-quick) ne fait la gestion des routes tout seul."""
+    for ip in wanted_ips:
+        sh("ip", "route", "replace", f"{ip}/32", "dev", WG_IFACE, check=False)
+
+
+def sync_peers(
+    current_peers: dict[str, dict],
+    my_pubkey: str,
+    my_ip: str,
+    gateway_addrs: dict[str, set[str]] | None = None,
+) -> None:
     """Ajoute/retire les peers WireGuard pour matcher exactement ce qu'annonce etcd."""
+    gateway_addrs = gateway_addrs or {}
     wanted = {}
     for key, info in current_peers.items():
         site = key.rsplit("/", 1)[-1]
@@ -209,16 +265,28 @@ def sync_peers(current_peers: dict[str, dict], my_pubkey: str, my_ip: str) -> No
     if _technician_pubkey:
         existing_pubkeys.discard(_technician_pubkey)
 
+    all_gateway_ips: set[str] = set()
     for pubkey, (endpoint, overlay_ip, site) in wanted.items():
-        if pubkey in existing_pubkeys:
-            continue
-        log.info(f"adding peer site={site} pubkey={pubkey[:12]}... endpoint={endpoint}")
-        sh(
-            "wg", "set", WG_IFACE, "peer", pubkey,
-            "endpoint", f"{endpoint}:{WG_LISTEN_PORT}",
-            "allowed-ips", f"{overlay_ip}/32",
-            "persistent-keepalive", "25",
-        )
+        extra_ips = gateway_addrs.get(site, set())
+        all_gateway_ips |= extra_ips
+        allowed = ",".join([f"{overlay_ip}/32"] + [f"{ip}/32" for ip in sorted(extra_ips)])
+        if pubkey not in existing_pubkeys:
+            log.info(f"adding peer site={site} pubkey={pubkey[:12]}... endpoint={endpoint}")
+            sh(
+                "wg", "set", WG_IFACE, "peer", pubkey,
+                "endpoint", f"{endpoint}:{WG_LISTEN_PORT}",
+                "allowed-ips", allowed,
+                "persistent-keepalive", "25",
+            )
+        elif GATEWAY_ROUTING and extra_ips:
+            # Peer déjà là (handshake établi) : ne réinitialise que
+            # allowed-ips, sans toucher endpoint/keepalive, pour ne pas
+            # perturber une session en cours si de nouveaux nœuds
+            # storage/service apparaissent côté distant après coup.
+            sh("wg", "set", WG_IFACE, "peer", pubkey, "allowed-ips", allowed, check=False)
+
+    if GATEWAY_ROUTING and all_gateway_ips:
+        sync_gateway_routes(all_gateway_ips)
 
     stale = existing_pubkeys - set(wanted.keys())
     for pubkey in stale:
@@ -280,7 +348,13 @@ async def watch_loop(session: aiohttp.ClientSession, my_pubkey: str, my_ip: str)
     while _running:
         try:
             peers = await etcd_list(session, "/wireguard/peers/")
-            sync_peers(peers, my_pubkey, my_ip)
+            gateway_addrs = {}
+            if GATEWAY_ROUTING:
+                for key in peers:
+                    site = key.rsplit("/", 1)[-1]
+                    if site != SITE:
+                        gateway_addrs[site] = await discover_site_addresses(session, site)
+            sync_peers(peers, my_pubkey, my_ip, gateway_addrs)
         except Exception as exc:
             log.warning(f"peer sync failed: {exc}")
         await asyncio.sleep(WATCH_INTERVAL)
@@ -297,6 +371,8 @@ async def main() -> None:
         privkey, pubkey = ensure_keypair("wg0")
 
         setup_interface(privkey, overlay_ip)
+        if GATEWAY_ROUTING:
+            enable_forwarding()
         await register(session, pubkey, my_ip, overlay_ip)
         generate_technician_profile(pubkey, my_ip, OVERLAY_CIDR)
 
