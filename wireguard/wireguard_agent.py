@@ -210,10 +210,26 @@ def enable_forwarding() -> None:
     réel multi-hôtes uniquement, cf. GATEWAY_ROUTING). Namespace réseau du
     conteneur uniquement (capacité NET_ADMIN) — aucune modification de
     l'hôte : `net.ipv4.ip_forward` est per-netns, pas un réglage sysctl
-    global du noyau hôte."""
-    Path("/proc/sys/net/ipv4/ip_forward").write_text("1\n")
+    global du noyau hôte.
+
+    Docker masque /proc/sys/net/ipv4/ip_forward en lecture seule par
+    défaut, même avec NET_ADMIN (constaté : `OSError: Read-only file
+    system` au premier lancement de cette fonction) — il doit être activé
+    depuis EN DEHORS du conteneur, via `sysctls: net.ipv4.ip_forward=1`
+    dans le docker-compose (déjà fait dans deploy/docker-compose.prod.yml
+    et les topologies de test). L'écriture ici reste tentée pour les
+    environnements où /proc/sys n'est pas masqué, mais n'est plus
+    bloquante : sans elle, seule la règle iptables ci-dessous ne suffit à
+    rien si le forwarding est resté désactivé côté compose."""
+    try:
+        Path("/proc/sys/net/ipv4/ip_forward").write_text("1\n")
+    except OSError as exc:
+        log.warning(
+            f"could not write ip_forward directly ({exc}) — "
+            "relying on `sysctls: net.ipv4.ip_forward=1` set in the compose file"
+        )
     sh("iptables", "-P", "FORWARD", "ACCEPT", check=False)
-    log.info("gateway routing enabled: ip_forward=1, FORWARD policy=ACCEPT")
+    log.info("gateway routing enabled: FORWARD policy=ACCEPT")
 
 
 async def discover_site_addresses(session: aiohttp.ClientSession, site: str) -> set[str]:
@@ -258,9 +274,10 @@ def sync_peers(
         pubkey = info.get("pubkey")
         endpoint = info.get("endpoint")
         overlay_ip = info.get("overlay_ip")
+        port = info.get("port", WG_LISTEN_PORT)
         if not (pubkey and endpoint and overlay_ip):
             continue
-        wanted[pubkey] = (endpoint, overlay_ip, site)
+        wanted[pubkey] = (endpoint, port, overlay_ip, site)
 
     dump = sh("wg", "show", WG_IFACE, "dump", check=False)
     existing_pubkeys = set()
@@ -277,15 +294,15 @@ def sync_peers(
         existing_pubkeys.discard(_technician_pubkey)
 
     all_gateway_ips: set[str] = set()
-    for pubkey, (endpoint, overlay_ip, site) in wanted.items():
+    for pubkey, (endpoint, port, overlay_ip, site) in wanted.items():
         extra_ips = gateway_addrs.get(site, set())
         all_gateway_ips |= extra_ips
         allowed = ",".join([f"{overlay_ip}/32"] + [f"{ip}/32" for ip in sorted(extra_ips)])
         if pubkey not in existing_pubkeys:
-            log.info(f"adding peer site={site} pubkey={pubkey[:12]}... endpoint={endpoint}")
+            log.info(f"adding peer site={site} pubkey={pubkey[:12]}... endpoint={endpoint}:{port}")
             sh(
                 "wg", "set", WG_IFACE, "peer", pubkey,
-                "endpoint", f"{endpoint}:{WG_LISTEN_PORT}",
+                "endpoint", f"{endpoint}:{port}",
                 "allowed-ips", allowed,
                 "persistent-keepalive", "25",
             )
@@ -345,9 +362,16 @@ PersistentKeepalive = 25
 # ── cycle de vie ──────────────────────────────────────────────────────────────
 
 async def register(session: aiohttp.ClientSession, pubkey: str, my_ip: str, overlay_ip: str) -> None:
-    value = json.dumps({"pubkey": pubkey, "endpoint": my_ip, "overlay_ip": overlay_ip})
+    # Le port est annoncé explicitement (pas supposé identique à celui de
+    # chaque pair) : deux sites derrière des contraintes de pare-feu
+    # différentes peuvent légitimement utiliser des ports WireGuard
+    # distincts (constaté en construisant la validation réseaux-isolés, où
+    # 2 sites sur le même hôte de test ne peuvent pas publier le même port
+    # — sync_peers() doit alors utiliser LE PORT DE CHAQUE PAIR, pas le
+    # sien propre).
+    value = json.dumps({"pubkey": pubkey, "endpoint": my_ip, "overlay_ip": overlay_ip, "port": WG_LISTEN_PORT})
     await etcd_put(session, f"/wireguard/peers/{SITE}", value)
-    log.info(f"registered site={SITE} endpoint={my_ip} overlay_ip={overlay_ip}")
+    log.info(f"registered site={SITE} endpoint={my_ip}:{WG_LISTEN_PORT} overlay_ip={overlay_ip}")
 
 
 async def deregister(session: aiohttp.ClientSession) -> None:

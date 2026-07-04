@@ -27,6 +27,12 @@ services:
     restart: always
     cap_add: [NET_ADMIN]
     devices: ["/dev/net/tun"]
+    # net.ipv4.ip_forward=1 doit être posé depuis l'extérieur du conteneur
+    # (Docker masque /proc/sys/net/ipv4/ip_forward en lecture seule même
+    # avec NET_ADMIN) — namespace réseau de CE conteneur uniquement,
+    # aucune modification de l'hôte.
+    sysctls:
+      - net.ipv4.ip_forward=1
     ports:
       - "51820:51820/udp"
     environment:

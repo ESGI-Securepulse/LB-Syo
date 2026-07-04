@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Corrigé
+- **`enable_forwarding()` plantait le conteneur au démarrage** (`WG_GATEWAY_ROUTING=1`) :
+  `/proc/sys/net/ipv4/ip_forward` est en lecture seule à l'intérieur du
+  conteneur même avec `NET_ADMIN` (Docker le masque par défaut) —
+  découvert en construisant la validation réseaux-isolés. L'écriture n'est
+  plus bloquante (avertissement si elle échoue) ; `net.ipv4.ip_forward=1`
+  doit être posé depuis l'EXTÉRIEUR du conteneur via `sysctls:` dans le
+  docker-compose (ajouté à `deploy/docker-compose.prod.yml`).
+- **`sync_peers()` utilisait toujours SON PROPRE `WG_LISTEN_PORT`** pour
+  construire l'endpoint de CHAQUE pair, au lieu du port que ce pair a lui-même
+  annoncé — invisible tant que tous les sites utilisent le port par défaut
+  (51820), mais casse le handshake dès que deux sites utilisent des ports
+  différents (ex. contrainte de pare-feu, ou 2 sites de test sur le même
+  hôte ne pouvant pas publier le même port). Le port est désormais annoncé
+  explicitement dans l'enregistrement etcd de chaque site et utilisé tel
+  quel pour construire son endpoint.
+
 ### Ajouté
 - `wireguard/` : `WG_ENDPOINT_OVERRIDE` permet d'annoncer une adresse
   publique/flottante différente de l'IP locale détectée (NAT) — nécessaire
