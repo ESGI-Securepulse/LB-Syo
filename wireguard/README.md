@@ -31,6 +31,7 @@ un déploiement réel sur noyau < 5.6 est identifié.
 | `WG_SITE_PREFIX` | *(auto)* | Préfixe IP à utiliser comme endpoint public (sinon 1ère IP non-loopback) |
 | `WG_WATCH_INTERVAL` | `15` | Intervalle (s) de resynchronisation des peers |
 | `WG_GATEWAY_ROUTING` | `0` | `1` = ce conteneur devient la passerelle site-à-site de son DC (voir ci-dessous) |
+| `WG_ENDPOINT_OVERRIDE` | *(auto)* | IP/nom DNS public à annoncer aux autres sites, si différent de l'IP locale détectée (NAT, IP flottante) |
 
 ## Passerelle site-à-site réelle (`WG_GATEWAY_ROUTING=1`)
 

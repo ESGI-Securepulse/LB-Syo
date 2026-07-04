@@ -3,6 +3,11 @@
 ## [Unreleased]
 
 ### Ajouté
+- `wireguard/` : `WG_ENDPOINT_OVERRIDE` permet d'annoncer une adresse
+  publique/flottante différente de l'IP locale détectée (NAT) — nécessaire
+  en production dès que l'IP visible localement par le conteneur diffère
+  de celle par laquelle les autres sites doivent le joindre, et utilisé
+  par la validation en réseaux isolés (`integration/tests/topology-isolated/`).
 - `wireguard/` : le sidecar peut désormais agir comme **passerelle
   site-à-site** (`WG_GATEWAY_ROUTING=1`, déploiement réel multi-hôtes
   uniquement) — forwarding IP + annonce dans les `allowed-ips` des

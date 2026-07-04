@@ -121,6 +121,17 @@ async def wait_etcd(session: aiohttp.ClientSession) -> None:
 # ── détection d'IP locale (même logique que storage-lucien/entrypoint.sh) ──
 
 def detect_my_ip() -> str:
+    # Override explicite de l'endpoint annoncé aux autres sites (IP ou nom
+    # DNS public), distinct de la détection locale : nécessaire dès que
+    # l'adresse localement visible par ce conteneur (SITE_PREFIX/hostname -I)
+    # n'est pas celle par laquelle les AUTRES sites doivent le joindre — cas
+    # standard derrière NAT (IP privée locale + IP publique/flottante
+    # distincte), et utilisé par la validation réseaux-isolés (cf.
+    # integration/tests/topology-isolated/) où chaque site n'est, par
+    # construction, joignable depuis l'autre que via un port publié sur
+    # l'hôte, pas via son IP de bridge interne.
+    if os.environ.get("WG_ENDPOINT_OVERRIDE"):
+        return os.environ["WG_ENDPOINT_OVERRIDE"]
     if SITE_PREFIX:
         out = sh("ip", "-4", "addr")
         for line in out.splitlines():
